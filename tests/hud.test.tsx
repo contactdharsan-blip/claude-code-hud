@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
 import { barParts, callLabel, fmtModel, fmtSpan, fmtTokens, parseNumstat, parsePorcelain } from '../hooks/format'
-import { parseBlocks, parseInline, plain, wrapRuns } from '../hooks/notion'
+import { displayWidth, parseBlocks, parseInline, plain, wrapRuns } from '../hooks/notion'
 
 const SURFACES = ['terminal', 'desktop'] as const
 
@@ -314,6 +314,46 @@ describe('notion', () => {
     expect(rows[0]!.find(r => r.t === 'two')).toMatchObject({ bold: true })
   })
 
+  test('regressions: inputs that lost text or structure in review', () => {
+    // a heading's own `#` is content; only a space-separated run closes it
+    const headingText = (md: string) => {
+      const b = parseBlocks(md)[0]
+      return b?.k === 'heading' ? plain(b.inl) : null
+    }
+    expect(headingText('## Why C#')).toBe('Why C#')
+    expect(headingText('## F# and C# ##')).toBe('F# and C#')
+    // a fence inside a tight list item stays a code block, indented under the item
+    const tight = parseBlocks(['- Run:', '  ```sh', '  git status', '  git log --oneline', '  ```', '- Then check.'].join('\n'))
+    expect(tight.map(b => b.k)).toEqual(['item', 'code', 'item'])
+    expect(tight[1]).toMatchObject({ lang: 'sh', source: 'git status\ngit log --oneline', indent: 2 })
+    // an unclosed fence (still streaming) is code to the end, not prose
+    expect(parseBlocks('- Run:\n  ```sh\n  git status')[1]).toMatchObject({ k: 'code', source: 'git status' })
+    // one level of parentheses in a URL
+    const wiki = parseInline('see [Foo](https://en.wikipedia.org/wiki/Foo_(bar)) now')
+    expect(wiki.find(r => r.t === 'Foo')).toMatchObject({ href: 'https://en.wikipedia.org/wiki/Foo_(bar)' })
+    expect(plain(wiki)).toBe('see Foo now')
+    expect(parseInline('at https://en.wikipedia.org/wiki/Foo_(bar).').find(r => r.href)?.href).toBe('https://en.wikipedia.org/wiki/Foo_(bar)')
+    // nesting follows the indents used: 4-space sublists are depth 1, not 2
+    const depths = parseBlocks('- a\n    - b\n        - c\n- d').map(b => (b.k === 'item' ? `${b.depth}${b.marker}` : b.k))
+    expect(depths).toEqual(['0•', '1◦', '2▪', '0•'])
+    // pathological input is shown as typed, quickly
+    const t0 = Date.now()
+    expect(plain(parseInline('['.repeat(16000) + 'a'))).toBe('['.repeat(16000) + 'a')
+    expect(Date.now() - t0).toBeLessThan(200)
+  })
+
+  test('wrapping never splits a grapheme and counts wide characters as two columns', () => {
+    const party = wrapRuns([{ t: '🎉'.repeat(12) }], 5)
+    for (const row of party) {
+      expect(plain(row)).not.toMatch(/[\uD800-\uDFFF](?![\uDC00-\uDFFF])/u)
+      expect(displayWidth(plain(row))).toBeLessThanOrEqual(5)
+    }
+    expect(party.map(plain).join('')).toBe('🎉'.repeat(12))
+    const family = '👨‍👩‍👧‍👦'.repeat(4)
+    expect(wrapRuns([{ t: family }], 5).map(plain).join('')).toBe(family)
+    for (const row of wrapRuns([{ t: '这是一个很长的中文句子用来测试换行' }], 20)) expect(displayWidth(plain(row))).toBeLessThanOrEqual(20)
+  })
+
   test('/hud notion on draws replies as a page; off hands them back', async ($, on) => {
     session(on)
     on('ui.render', ($, e) => {
@@ -342,5 +382,11 @@ describe('notion', () => {
       expect(await ui.find({ type: 'Markdown' })).toBeDefined()
       await ui.unmount()
     }
+
+    // a table too long for the Markdown element: the engine draws the whole reply, nothing is cut
+    const big = ['| a | b |', '|---|---|', ...Array.from({ length: 1500 }, (_, k) => `| ${k} | row ${k} |`)].join('\n')
+    const long = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...MSG, props: { text: big, isFirstOfReply: false } })
+    expect(await long.find({ text: 'engine' })).toBeDefined()
+    await long.unmount()
   })
 })

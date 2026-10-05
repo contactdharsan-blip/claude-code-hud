@@ -11,7 +11,7 @@ export type Block =
   | { k: 'item'; depth: number; marker: string; task: 'open' | 'done' | null; inl: Inline[] }
   | { k: 'quote'; lines: Inline[][] }
   | { k: 'callout'; icon: string; title: string | null; tone: Tone; lines: Inline[][] }
-  | { k: 'code'; lang: string; source: string }
+  | { k: 'code'; lang: string; source: string; indent: number }
   | { k: 'table'; md: string }
   | { k: 'rule' }
 
@@ -25,8 +25,8 @@ const ALERTS: Record<string, { icon: string; tone: Tone }> = {
   CAUTION: { icon: '🛑', tone: 'caution' },
 }
 
-const FENCE = /^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)/
-const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$/
+const FENCE = /^(\s*)(`{3,}|~{3,})\s*([\w+#.-]*)/
+const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/
 const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/
 const ITEM = /^(\s*)([-*+]|\d{1,3}[.)])\s+(?:\[([ xX])\]\s+)?(.*)$/
 const QUOTE = /^\s{0,3}>\s?(.*)$/
@@ -39,6 +39,7 @@ const BULLETS = ['•', '◦', '▪']
 export function parseBlocks(md: string): Block[] {
   const lines = md.replace(/\r\n?/g, '\n').split('\n')
   const out: Block[] = []
+  let listIndents: number[] = []
   let i = 0
   while (i < lines.length) {
     const line = lines[i]!
@@ -46,15 +47,20 @@ export function parseBlocks(md: string): Block[] {
       i += 1
       continue
     }
+    if (!ITEM.test(line) && !/^\s/.test(line)) listIndents = []
 
     const fence = FENCE.exec(line)
     if (fence) {
-      const close = fence[1]!
+      const indent = fence[1]!.replace(/\t/g, '    ').length
+      const close = fence[2]!
       const body: string[] = []
       i += 1
-      while (i < lines.length && !lines[i]!.trimStart().startsWith(close)) body.push(lines[i++]!)
+      // an unclosed fence (a reply still streaming) runs to the end
+      while (i < lines.length && !lines[i]!.trimStart().startsWith(close)) {
+        body.push(lines[i++]!.replace(new RegExp(`^ {0,${indent}}`), ''))
+      }
       i += 1
-      out.push({ k: 'code', lang: fence[2] ?? '', source: body.join('\n') })
+      out.push({ k: 'code', lang: fence[3] ?? '', source: body.join('\n'), indent })
       continue
     }
 
@@ -88,15 +94,25 @@ export function parseBlocks(md: string): Block[] {
     const item = ITEM.exec(line)
     if (item) {
       const indent = item[1]!.replace(/\t/g, '    ').length
+      // nesting follows the indents actually used, whatever their width
+      while (listIndents.length && indent < listIndents[listIndents.length - 1]!) listIndents.pop()
+      if (!listIndents.length || indent > listIndents[listIndents.length - 1]!) listIndents.push(indent)
       const ordered = /\d/.test(item[2]!)
       const box = item[3]
       let text = item[4] ?? ''
       i += 1
       // a lazy continuation line belongs to the item above
-      while (i < lines.length && lines[i]!.trim() !== '' && /^\s{2,}\S/.test(lines[i]!) && !ITEM.test(lines[i]!)) {
+      while (
+        i < lines.length &&
+        lines[i]!.trim() !== '' &&
+        /^\s{2,}\S/.test(lines[i]!) &&
+        !ITEM.test(lines[i]!) &&
+        !FENCE.test(lines[i]!) &&
+        !TABLE_ROW.test(lines[i]!)
+      ) {
         text += ' ' + lines[i++]!.trim()
       }
-      const depth = Math.min(3, Math.floor(indent / 2))
+      const depth = Math.min(6, listIndents.length - 1)
       out.push({
         k: 'item',
         depth,
@@ -148,12 +164,16 @@ function quoteBlock(body: string[]): Block {
 }
 
 const INLINE =
-  /(`+)([\s\S]*?[^`])\1(?!`)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|~~([\s\S]+?)~~|\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)|(?<![\w*])\*(?![\s*])([^*]+?)(?<!\s)\*(?![\w*])|(?<![\w_])_(?![\s_])([^_]+?)(?<!\s)_(?![\w_])|(https?:\/\/[^\s<>)\]]+[^\s<>)\].,;:!?'"])/g
+  /(`+)([\s\S]*?[^`])\1(?!`)|\*\*([\s\S]+?)\*\*|__([\s\S]+?)__|~~([\s\S]+?)~~|\[([^\]]+)\]\(((?:[^()\s]|\([^()\s]*\))+)(?:\s+"[^"]*")?\)|(?<![\w*])\*(?![\s*])([^*]+?)(?<!\s)\*(?![\w*])|(?<![\w_])_(?![\s_])([^_]+?)(?<!\s)_(?![\w_])|(https?:\/\/(?:[^\s<>()[\]]|\([^\s<>()]*\))*(?:[^\s<>()[\].,;:!?'"]|\([^\s<>()]*\)))/g
 
 type Style = Omit<Inline, 't'>
 
+/** Longest line given inline parsing; past it the regex's worst case grows quadratically. */
+const INLINE_MAX = 2000
+
 /** Inline markdown to styled runs; bold, italic and strike nest, code does not. */
 export function parseInline(text: string, style: Style = {}): Inline[] {
+  if (text.length > INLINE_MAX) return [{ ...style, t: text }]
   const out: Inline[] = []
   let last = 0
   for (const m of text.matchAll(INLINE)) {
@@ -174,8 +194,26 @@ export function parseInline(text: string, style: Style = {}): Inline[] {
 /** The plain text of runs: what a reader would copy. */
 export const plain = (inl: Inline[]) => inl.map(r => r.t).join('')
 
-/** Greedy word wrap of styled runs to `width` columns, styles kept per word.
- * Used where each drawn row needs its own gutter glyph (a quote's bar). */
+/** Graphemes, so an emoji or a ZWJ family is never split between rows. */
+const graphemes = (s: string): string[] =>
+  typeof Intl !== 'undefined' && 'Segmenter' in Intl
+    ? Array.from(new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(s), g => g.segment)
+    : Array.from(s)
+
+const WIDE = /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6]|[\u{20000}-\u{3FFFD}]/u
+
+/** Terminal columns one grapheme takes: 2 for CJK and emoji, else 1. */
+function cells(g: string): number {
+  if (WIDE.test(g)) return 2
+  if (/\p{Extended_Pictographic}/u.test(g) && (/\p{Emoji_Presentation}/u.test(g) || g.includes('\uFE0F'))) return 2
+  return 1
+}
+
+export const displayWidth = (s: string): number => graphemes(s).reduce((n, g) => n + cells(g), 0)
+
+/** Greedy word wrap of styled runs to `width` terminal columns, styles kept
+ * per word, graphemes never split. Used where each drawn row needs its own
+ * gutter glyph (a quote's bar). */
 export function wrapRuns(inl: Inline[], width: number): Inline[][] {
   const w = Math.max(4, width)
   const lines: Inline[][] = [[]]
@@ -199,20 +237,32 @@ export function wrapRuns(inl: Inline[], width: number): Inline[][] {
         }
         continue
       }
-      let word = piece
-      while (word.length > 0) {
-        if (col + word.length <= w) {
-          line().push({ ...r, t: word })
-          col += word.length
-          word = ''
-        } else if (col === 0) {
-          line().push({ ...r, t: word.slice(0, w) })
-          word = word.slice(w)
-          breakLine()
-        } else {
-          breakLine()
-        }
+      const wordWidth = displayWidth(piece)
+      if (col + wordWidth <= w) {
+        line().push({ ...r, t: piece })
+        col += wordWidth
+        continue
       }
+      if (col > 0 && wordWidth <= w) {
+        breakLine()
+        line().push({ ...r, t: piece })
+        col = wordWidth
+        continue
+      }
+      // a word longer than a row: break it between graphemes
+      if (col > 0) breakLine()
+      let chunk = ''
+      for (const g of graphemes(piece)) {
+        const gw = cells(g)
+        if (col + gw > w && chunk) {
+          line().push({ ...r, t: chunk })
+          breakLine()
+          chunk = ''
+        }
+        chunk += g
+        col += gw
+      }
+      if (chunk) line().push({ ...r, t: chunk })
     }
   }
   return lines.filter((l, i) => l.length > 0 || i === 0)

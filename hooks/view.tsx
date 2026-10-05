@@ -600,16 +600,17 @@ function drawBlock(ui: DocUI, b: Block, prose: number, full: number): RenderElem
         </Box>
       )
     case 'code': {
-      const source = b.source.length > CODE_MAX ? b.source.slice(0, CODE_MAX - 1) + '…' : b.source || ' '
+      const source = b.source || ' '
+      const indent = Math.min(8, b.indent)
       return (
-        <Box flexDirection="column" width={full} backgroundColor={INK.calloutBg} paddingX={1}>
+        <Box flexDirection="column" marginLeft={indent} width={Math.max(20, full - indent)} backgroundColor={INK.calloutBg} paddingX={1}>
           {b.lang ? <Text dimColor>{b.lang}</Text> : null}
           <Code source={source} language={b.lang || undefined} />
         </Box>
       )
     }
     case 'table':
-      return <Markdown text={b.md.slice(0, CODE_MAX)} />
+      return <Markdown text={b.md} />
     case 'rule':
       return <Text color={INK.rule}>{'─'.repeat(Math.max(4, prose))}</Text>
   }
@@ -629,6 +630,9 @@ function gapBefore(b: Block, prev: Block | undefined): number {
 export function notionReply(ui: DocUI, md: string, columns: number, isFirst: boolean, proseCap: number): RenderElement | null {
   const blocks = parseBlocks(md)
   if (blocks.length === 0) return null
+  // The engine's Code and Markdown elements take at most 10,000 characters;
+  // rather than cut a long block, the engine draws the whole reply as usual.
+  if (blocks.some(b => (b.k === 'code' ? b.source.length : b.k === 'table' ? b.md.length : 0) > CODE_MAX)) return null
   const { Box, Text } = ui
   const full = Math.max(20, columns - 2)
   const prose = Math.max(20, Math.min(full, proseCap > 0 ? proseCap : full))

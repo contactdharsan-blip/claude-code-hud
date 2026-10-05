@@ -106,6 +106,8 @@ A terminal draws text in one size, so headings stand out by weight, colour and s
 
 The mod hot-reloads in any interactive session that loaded it, when you save a file.
 
+`tsconfig.json` extends `.claude-plugin/types/tsconfig.json`, which Claude Code writes (with the API types for the build you run) the first time an interactive session loads the mod. Until then your editor shows unresolved types; start `claude --plugin-dir .` once from the repo to lay them.
+
 ```sh
 claude plugin validate ~/.claude/mods/hud   # what it hooks and calls, and anything the engine would refuse
 claude plugin test ~/.claude/mods/hud       # the tests in tests/, on the terminal and desktop surfaces
