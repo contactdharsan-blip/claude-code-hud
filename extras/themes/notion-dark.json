@@ -1,0 +1,25 @@
+{
+  "name": "Notion Dark",
+  "base": "dark",
+  "overrides": {
+    "text": "rgb(211,211,211)",
+    "inactive": "rgb(155,155,155)",
+    "subtle": "rgb(90,90,88)",
+    "promptBorder": "rgb(74,74,72)",
+    "composerSidebarBackground": "rgb(44,44,43)",
+    "userMessageBackground": "rgb(47,47,47)",
+    "permission": "rgb(82,156,202)",
+    "suggestion": "rgb(82,156,202)",
+    "remember": "rgb(82,156,202)",
+    "ide": "rgb(82,156,202)",
+    "success": "rgb(77,171,154)",
+    "error": "rgb(255,115,105)",
+    "warning": "rgb(202,152,73)",
+    "autoAccept": "rgb(154,109,215)",
+    "skill": "rgb(154,109,215)",
+    "merged": "rgb(154,109,215)",
+    "bashBorder": "rgb(226,85,161)",
+    "rate_limit_fill": "rgb(82,156,202)",
+    "rate_limit_empty": "rgb(47,47,47)"
+  }
+}

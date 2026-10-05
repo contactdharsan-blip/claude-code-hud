@@ -1,0 +1,25 @@
+{
+  "name": "Notion Light",
+  "base": "light",
+  "overrides": {
+    "text": "rgb(55,53,47)",
+    "inactive": "rgb(120,119,116)",
+    "subtle": "rgb(172,171,167)",
+    "promptBorder": "rgb(214,213,209)",
+    "composerSidebarBackground": "rgb(247,246,243)",
+    "userMessageBackground": "rgb(241,241,239)",
+    "permission": "rgb(51,126,169)",
+    "suggestion": "rgb(51,126,169)",
+    "remember": "rgb(51,126,169)",
+    "ide": "rgb(51,126,169)",
+    "success": "rgb(68,131,97)",
+    "error": "rgb(212,76,71)",
+    "warning": "rgb(203,145,47)",
+    "autoAccept": "rgb(144,101,176)",
+    "skill": "rgb(144,101,176)",
+    "merged": "rgb(144,101,176)",
+    "bashBorder": "rgb(193,76,138)",
+    "rate_limit_fill": "rgb(51,126,169)",
+    "rate_limit_empty": "rgb(233,233,231)"
+  }
+}

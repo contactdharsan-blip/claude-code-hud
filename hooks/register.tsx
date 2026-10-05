@@ -1,0 +1,474 @@
+// HUD: an app-like heads-up display for Claude Code's terminal.
+//
+//   band   a rounded strip above the prompt: model, context, rate limits,
+//          cost, branch and the running turn, narrowed by priority to fit
+//   pane   a docked inspector of rounded cards: Session, Context, Usage,
+//          Activity, Tasks, Agents, Files (a card with nothing to say hides)
+//   /hud   toggles the pane; `/hud band|auto|bubble|notion ...` set preferences
+//   notion (opt-in) draws Claude's replies as a Notion page: bullets, to-dos,
+//          quote bars, filled callouts, inline-code pills, a prose column
+//
+// The mod stays passive until a surface draws, so headless `claude -p` runs
+// (scripts, pipelines, CI) pay nothing but a few pass-through hooks.
+
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, Timer } from 'claude-code'
+
+import type { HudAgent, HudBandMode, HudCall, HudLive, HudPrefs, HudTask, HudUsage } from '../types'
+import { callLabel, categoryName, fmtTokens, parseNumstat, parsePorcelain } from './format'
+import { band, bubble, hintTail, notionReply, pane, type HudData } from './view'
+
+type $ = EngineInterface
+
+const MAX_CALLS = 60
+const WRITES = new Set(['Edit', 'Write', 'NotebookEdit'])
+const GIT_TOUCHING = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash'])
+const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'])
+const BAND_MODES: HudBandMode[] = ['auto', 'full', 'compact', 'minimal', 'off']
+
+/** Swallows a collector's failure: the HUD degrades, the session never does. */
+const quietly = (work: Promise<unknown>) => {
+  void work.catch(() => undefined)
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+// Every value the HUD draws from, as `$.state` atoms: they survive a hot reload,
+// module variables do not. Declared here, not imported, because the engine lists
+// what a module reads and writes by scanning for atoms that are consts of its file.
+
+const PANE = 'hud'
+
+const DEFAULT_PREFS: HudPrefs = { band: 'auto', paneAuto: true, bubble: false, notion: false }
+
+const EMPTY_USAGE: HudUsage = {
+  model: '',
+  turns: 0,
+  startedAt: 0,
+  ctxTokens: null,
+  ctxWindow: 0,
+  ctxPercent: null,
+  limits: [],
+  usd: null,
+}
+
+const IDLE: HudLive = { isWorking: false, turnId: null, turnStartedAt: null, toolsThisTurn: 0, now: 0 }
+
+const usageAtom = atom({ plugin: 'hud', key: 'usage' } as const, EMPTY_USAGE)
+const breakdownAtom = atom({ plugin: 'hud', key: 'breakdown' } as const, null)
+const gitAtom = atom({ plugin: 'hud', key: 'git' } as const, null)
+const callsAtom = atom({ plugin: 'hud', key: 'calls' } as const, [])
+const tasksAtom = atom({ plugin: 'hud', key: 'tasks' } as const, [])
+const agentsAtom = atom({ plugin: 'hud', key: 'agents' } as const, [])
+const filesAtom = atom({ plugin: 'hud', key: 'files' } as const, [])
+const liveAtom = atom({ plugin: 'hud', key: 'live' } as const, IDLE)
+const prefsAtom = atom({ plugin: 'hud', key: 'prefs' } as const, DEFAULT_PREFS)
+const paneOpenedAtom = atom({ plugin: 'hud', key: 'paneOpened' } as const, false)
+
+// ─── Collectors ───────────────────────────────────────────────────────────────
+// They read the session through `$` and write the atoms. None of them calls a
+// model; git runs only when asked (turn end, after an edit), never on an idle
+// timer, and with --no-optional-locks so it never takes the index lock from
+// under a git command the model is running. They live in this file because `$`
+// may only be passed to functions declared here: the engine follows it
+// statically, and never across an import.
+
+/** Whether a fresh reading equals what is held: an unchanged value is not written,
+ * so its readers do not redraw. */
+const same = (held: unknown, value: unknown) => JSON.stringify(held) === JSON.stringify(value)
+
+async function refreshUsage($: $): Promise<void> {
+  const [u, model, turns] = await Promise.all([$.session.usage(), $.session.model(), $.session.turns()])
+  const value: HudUsage = {
+    model,
+    turns,
+    startedAt: u.startedAt,
+    ctxTokens: u.context.tokens ?? null,
+    ctxWindow: u.context.window,
+    ctxPercent: u.context.percent ?? null,
+    limits: u.rateLimits.map(r => ({ kind: r.kind, percentUsed: r.percentUsed, resetsAt: r.resetsAt ?? null })),
+    usd: u.cost?.usd ?? null,
+  }
+  if (!same(await read($, usageAtom), value)) await update($, usageAtom, () => value)
+}
+
+/** The /context breakdown, estimated locally (`summary` sends no requests). */
+async function refreshBreakdown($: $): Promise<void> {
+  const u = await $.session.usage({ breakdown: 'summary', columns: 40 })
+  const b = u.context.breakdown
+  if (!b) return
+  const top = b.categories
+    .filter(c => c.kind === 'used' && c.tokens > 0)
+    .sort((a, z) => z.tokens - a.tokens)
+    .slice(0, 3)
+    .map(c => ({ name: categoryName(c.name), tokens: c.tokens }))
+  const value = {
+    top,
+    total: b.totalTokens,
+    max: b.rawMaxTokens,
+    autoCompactAt: b.isAutoCompactEnabled && b.autoCompactThreshold ? b.autoCompactThreshold : null,
+  }
+  if (!same(await read($, breakdownAtom), value)) await update($, breakdownAtom, () => value)
+}
+
+async function refreshGit($: $): Promise<void> {
+  const cwd = await $.session.cwd()
+  const git = (...args: string[]) => $.process.run(['git', '--no-optional-locks', ...args], { cwd })
+  const top = await git('rev-parse', '--show-toplevel')
+  if (top.exitCode !== 0) {
+    if ((await read($, gitAtom)) !== null) await update($, gitAtom, () => null)
+    return
+  }
+  const [status, numstat] = await Promise.all([git('status', '--porcelain=v2', '--branch'), git('diff', '--numstat', 'HEAD')])
+  const p = parsePorcelain(status.stdout)
+  const value = {
+    root: top.stdout.trim(),
+    ...p,
+    numstat: numstat.exitCode === 0 ? parseNumstat(numstat.stdout) : {},
+  }
+  if (!same(await read($, gitAtom), value)) await update($, gitAtom, () => value)
+}
+
+const ACTIVE = new Set(['pending', 'running', 'waiting'])
+
+/** Returns whether any agent is still active, so the caller knows to keep polling. */
+async function refreshAgents($: $, at: number): Promise<boolean> {
+  const listed = await $.agent.list()
+  const held = await read($, agentsAtom)
+  const before = new Map(held.map(a => [a.id, a]))
+  const next: HudAgent[] = listed.map(a => {
+    const was = before.get(a.id)
+    const isActive = ACTIVE.has(a.status)
+    return {
+      id: a.id,
+      type: a.type,
+      description: a.description,
+      status: a.status,
+      firstSeen: was?.firstSeen ?? at,
+      endedAt: isActive ? null : (was?.endedAt ?? at),
+    }
+  })
+  if (!same(held, next)) await update($, agentsAtom, () => next)
+  return next.some(a => ACTIVE.has(a.status))
+}
+
+type Todo = { content: string; status: HudTask['status']; activeForm: string }
+
+/** Folds a settled task-tool call into the Tasks card. */
+async function noteTasks($: $, tool: string, input: Record<string, unknown>, result: unknown): Promise<void> {
+  const r = (result ?? {}) as Record<string, unknown>
+  if (tool === 'TodoWrite' && Array.isArray(r.newTodos)) {
+    const todos = r.newTodos as Todo[]
+    const value = todos.map(t => ({
+      id: t.content,
+      text: t.status === 'in_progress' ? t.activeForm || t.content : t.content,
+      status: t.status,
+    }))
+    await update($, tasksAtom, () => value)
+  } else if (tool === 'TaskList' && Array.isArray(r.tasks)) {
+    const tasks = r.tasks as { id: string; subject: string; status: HudTask['status'] }[]
+    const value = tasks.map(t => ({ id: t.id, text: t.subject, status: t.status }))
+    await update($, tasksAtom, () => value)
+  } else if (tool === 'TaskCreate' && r.task && typeof r.task === 'object') {
+    const t = r.task as { id: string; subject: string }
+    await update($, tasksAtom, list => [...list.filter(x => x.id !== t.id), { id: t.id, text: t.subject, status: 'pending' as const }])
+  } else if (tool === 'TaskUpdate' && typeof input.taskId === 'string') {
+    const id = input.taskId
+    const status = input.status
+    const subject = typeof input.subject === 'string' ? input.subject : undefined
+    await update($, tasksAtom, list =>
+      status === 'deleted'
+        ? list.filter(x => x.id !== id)
+        : list.map(x =>
+            x.id === id
+              ? {
+                  ...x,
+                  text: subject ?? x.text,
+                  status: status === 'pending' || status === 'in_progress' || status === 'completed' ? status : x.status,
+                }
+              : x,
+          ),
+    )
+  }
+}
+
+/** Remembers a file the session wrote, newest last, at most 30. */
+async function noteFile($: $, path: string): Promise<void> {
+  if (!path) return
+  await update($, filesAtom, list => [...list.filter(p => p !== path), path].slice(-30))
+}
+
+// ─── Wiring ───────────────────────────────────────────────────────────────────
+
+// Module state: lost on a hot reload by design; session.start rebuilds it.
+let active = false
+let working = false
+let agentsBusy = false
+let ticks = 0
+let tickMs = 0
+let ticker: Timer | null = null
+let gitTimer: Timer | null = null
+let home: string | null = null
+// The prose column of a Notion-style reply: settings' maxProseWidth, else 80.
+let proseCap = 80
+
+function now($: $): Promise<number> {
+  return $.clock.now()
+}
+
+async function loadPrefs($: $): Promise<HudPrefs> {
+  const stored = (await $.store.get('prefs')) as Partial<HudPrefs> | undefined
+  const prefs = { ...DEFAULT_PREFS, ...(stored ?? {}) }
+  await update($, prefsAtom, () => prefs)
+  return prefs
+}
+
+async function savePrefs($: $, change: Partial<HudPrefs>): Promise<HudPrefs> {
+  const prefs = await update($, prefsAtom, p => ({ ...p, ...change }))
+  await $.store.set('prefs', prefs)
+  return prefs
+}
+
+function gitSoon($: $) {
+  gitTimer?.cancel()
+  gitTimer = $.clock.after(1500, () => quietly(refreshGit($)))
+}
+
+/** One clock, paced by need: every second while a turn or an agent runs
+ * (elapsed times, agent polling every 2s), every 30s idle (reset countdowns). */
+function retime($: $) {
+  const want = working || agentsBusy ? 1000 : 30_000
+  if (ticker && tickMs === want) return
+  ticker?.cancel()
+  tickMs = want
+  ticker = $.clock.every(want, () => {
+    ticks += 1
+    quietly(now($).then(t => update($, liveAtom, l => ({ ...l, now: t }))))
+    if (agentsBusy && ticks % 2 === 0) {
+      quietly(
+        now($)
+          .then(t => refreshAgents($, t))
+          .then(b => {
+            agentsBusy = b
+            retime($)
+          }),
+      )
+    }
+  })
+}
+
+async function activate($: $): Promise<void> {
+  if (active) return
+  active = true
+  try {
+    home = (await $.env.get('HOME')) ?? null
+    // An unreadable setting is no reason to stay dark: keep the default width.
+    const settings = (await $.settings.read().catch(() => ({}))) as { maxProseWidth?: unknown }
+    if (typeof settings.maxProseWidth === 'number' && settings.maxProseWidth >= 40) proseCap = settings.maxProseWidth
+    const prefs = await loadPrefs($)
+    const live = await read($, liveAtom)
+    working = live.isWorking
+    // Each collector fails alone: a missing or slow git must not cost the rest.
+    await Promise.allSettled([
+      refreshUsage($),
+      refreshGit($),
+      now($)
+        .then(t => refreshAgents($, t))
+        .then(b => {
+          agentsBusy = b
+        }),
+    ])
+    quietly(refreshBreakdown($))
+    ticker?.cancel()
+    ticker = null
+    retime($)
+    if (prefs.paneAuto && !(await read($, paneOpenedAtom))) {
+      try {
+        await $.ui.open({ id: PANE, title: 'HUD' })
+        await update($, paneOpenedAtom, () => true)
+      } catch {
+        // Refused: leave the latch unset; `/hud` still opens it.
+      }
+    }
+  } catch {
+    active = false
+  }
+}
+
+async function data($: $): Promise<HudData> {
+  const [usage, breakdown, git, calls, tasks, agents, files, live, prefs] = await Promise.all([
+    read($, usageAtom),
+    read($, breakdownAtom),
+    read($, gitAtom),
+    read($, callsAtom),
+    read($, tasksAtom),
+    read($, agentsAtom),
+    read($, filesAtom),
+    read($, liveAtom),
+    read($, prefsAtom),
+  ])
+  return { usage, breakdown, git, calls, tasks, agents, files, live, prefs, home }
+}
+
+export const register: Register = on => {
+  on('session.start', async ($, e, next) => {
+    await $.command.register({
+      name: 'hud',
+      description: 'HUD: toggle the inspector pane, or set the band, auto-open and prompt bubble',
+      argumentHint: '[band auto|full|compact|minimal|off] [auto|bubble|notion on|off] [status]',
+      immediate: true,
+    })
+    if ((await $.session.surfaces()).length > 0) quietly(activate($))
+    return next(e)
+  })
+
+  on('turn.start', async ($, e, next) => {
+    if (active) {
+      const t = await now($)
+      await update($, liveAtom, l =>
+        l.isWorking ? l : { isWorking: true, turnId: e.turnId, turnStartedAt: t, toolsThisTurn: 0, now: t },
+      )
+      working = true
+      retime($)
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    // Not gated on `active`: the main loop's completion (no agentId) always ends
+    // the turn, even one whose start a hot reload made us lose track of.
+    const t = await now($)
+    const live = await read($, liveAtom)
+    if (live.isWorking && (e.agentId === undefined || live.turnId === e.turnId)) {
+      await update($, liveAtom, l => ({ ...l, isWorking: false, turnId: null, now: t }))
+      working = false
+    }
+    if (active) {
+      retime($)
+      quietly(refreshUsage($))
+      quietly(refreshBreakdown($))
+      quietly(refreshGit($))
+      quietly(
+        refreshAgents($, t).then(b => {
+          agentsBusy = b
+          retime($)
+        }),
+      )
+    }
+    return done
+  })
+
+  on('tool.call', async ($, e, next) => {
+    if (!active) return next(e)
+    const input = e as unknown as Record<string, unknown>
+    const call: HudCall = {
+      id: e.tool_use_id,
+      tool: e.tool,
+      label: callLabel(e.tool, input),
+      startedAt: await now($),
+      endedAt: null,
+      status: 'running',
+      isSubagent: e.agentId !== undefined,
+    }
+    await update($, callsAtom, list => [...list, call].slice(-MAX_CALLS))
+    if (!call.isSubagent) await update($, liveAtom, l => ({ ...l, toolsThisTurn: l.toolsThisTurn + 1 }))
+    if (e.tool === 'Agent') {
+      agentsBusy = true
+      retime($)
+    }
+
+    const ran = await next(e)
+
+    try {
+      const status = ran.deny !== undefined ? 'denied' : ran.isError ? 'error' : 'ok'
+      const endedAt = await now($)
+      await update($, callsAtom, list => list.map(c => (c.id === call.id ? { ...c, status, endedAt } : c)))
+      if (status === 'ok') {
+        // A subagent's own todo list is not the session's.
+        if (TASK_TOOLS.has(e.tool) && !call.isSubagent) await noteTasks($, e.tool, input, ran.result)
+        if (WRITES.has(e.tool)) {
+          const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
+          await noteFile($, path)
+        }
+      }
+      if (GIT_TOUCHING.has(e.tool)) gitSoon($)
+      quietly(refreshUsage($))
+    } catch {
+      // The tool's result stands whatever the HUD failed to record.
+    }
+    return ran
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    if (!active) $.clock.after(0, () => quietly(activate($)))
+    const d = await data($)
+    if (d.prefs.band === 'off') return next(e)
+    const tree = band($.ui.resolve(e), d, e.props.bodyColumns)
+    return tree ?? next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    return pane($.ui.resolve(e), await data($), e.props.bodyColumns)
+  })
+
+  on('ui.render', { component: 'PromptHint' }, async ($, e, next) => {
+    const prefs = await read($, prefsAtom)
+    if (prefs.band !== 'off') return next(e)
+    const tail = hintTail(await data($))
+    return tail ? next({ ...e, props: { ...e.props, tail } }) : next(e)
+  })
+
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+    const prefs = await read($, prefsAtom)
+    if (!prefs.notion) return next(e)
+    const tree = notionReply($.ui.resolve(e), e.props.text, e.viewport?.columns ?? 80, e.props.isFirstOfReply, proseCap)
+    return tree ?? next(e)
+  })
+
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    if (e.props.isExpanded || e.props.origin.kind !== 'composer') return next(e)
+    const prefs = await read($, prefsAtom)
+    if (!prefs.bubble) return next(e)
+    return bubble($.ui.resolve(e), e.props.text)
+  })
+
+  on('command.run', { command: 'hud' }, async ($, e) => {
+    await activate($)
+    const words = e.args.trim().toLowerCase().split(/\s+/).filter(Boolean)
+    const [verb, value] = words
+
+    if (verb === undefined || verb === 'pane') {
+      // A pane auto-opened on a narrow terminal is listed but waits undrawn;
+      // only one the person can see is closed, anything else is (re)opened,
+      // which seats it at any width because the person asked.
+      const isVisible = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced && p.isShown)
+      if (isVisible) {
+        await $.ui.close({ id: PANE })
+        return { text: 'HUD pane closed.' }
+      }
+      await $.ui.open({ id: PANE, title: 'HUD' })
+      return { text: 'HUD pane opened.' }
+    }
+    if (verb === 'band' && BAND_MODES.includes(value as HudBandMode)) {
+      await savePrefs($, { band: value as HudBandMode })
+      return { text: `HUD band: ${value}.` }
+    }
+    if ((verb === 'auto' || verb === 'bubble' || verb === 'notion') && (value === 'on' || value === 'off')) {
+      const enabled = value === 'on'
+      await savePrefs($, verb === 'auto' ? { paneAuto: enabled } : verb === 'bubble' ? { bubble: enabled } : { notion: enabled })
+      const what = verb === 'auto' ? 'pane auto-open' : verb === 'bubble' ? 'prompt bubble' : 'Notion-style replies'
+      return { text: `HUD ${what}: ${value}.` }
+    }
+    if (verb === 'status') {
+      const d = await data($)
+      const ctx = d.usage.ctxTokens !== null ? `${fmtTokens(d.usage.ctxTokens)} of ${fmtTokens(d.usage.ctxWindow)}` : 'not measured yet'
+      return {
+        text: `HUD band ${d.prefs.band}, pane auto-open ${d.prefs.paneAuto ? 'on' : 'off'}, bubble ${d.prefs.bubble ? 'on' : 'off'}, notion ${d.prefs.notion ? 'on' : 'off'}. Context ${ctx}.`,
+      }
+    }
+    return {
+      text: 'Usage: /hud (toggle pane) · /hud band auto|full|compact|minimal|off · /hud auto on|off · /hud bubble on|off · /hud notion on|off · /hud status',
+    }
+  })
+}
