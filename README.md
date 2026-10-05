@@ -10,10 +10,10 @@ A heads-up display for the Claude Code terminal that makes it read more like an 
 It is a Claude Code *mod*: a plugin of function hooks that runs inside Claude Code and hot-reloads when you edit it.
 
 ```
-╭──────────────────────────────────────────────────────────────────────────────────╮
-│ ● Opus 5.5 1M   ctx ▋      10%   5h ██▎    22% ↻1h29m   7d 12%   $0.75   ⎇ main ±5 │
-╰──────────────────────────────────────────────────────────────────────────────────╯
+ ● Opus 5.5 1M   ctx ▋      10%   5h ██▎    22% ↻1h29m   7d 12%   $0.75      ⎇ main ±5
 ```
+
+(One filled row by default, so it costs a single line of the window. `/hud band full` gives the bordered, rounded version.)
 
 ```
 ╭─ Session ──────────────────────╮     ╭─ Activity ──────── 6 this turn ─╮
@@ -29,7 +29,7 @@ It is a Claude Code *mod*: a plugin of function hooks that runs inside Claude Co
                                        ╰─────────────────────────────────╯
 ```
 
-(Illustrative layout. In the terminal each card title sits on its first row, and colours follow your Claude Code theme.)
+(Illustrative layout; the pane is one column of cards in the terminal. Titles sit on the card borders so no row is spent on a header, and colours follow your Claude Code theme.)
 
 ## Requirements
 
@@ -69,7 +69,7 @@ Check it loaded with `/hud status`.
 | Command | What it does |
 |---|---|
 | `/hud` | Open or close the inspector pane |
-| `/hud band auto\|full\|compact\|minimal\|off` | Band size. `auto` picks by width and drops the least important numbers first; context is kept last |
+| `/hud band auto\|slim\|full\|compact\|minimal\|off` | Band style. `auto` is `slim` (one filled row) from 70 columns and `minimal` (plain text) below; `full` and `compact` are the bordered rounded card. Every style drops the least important numbers first as it narrows; context is kept last |
 | `/hud auto on\|off` | Open the pane by itself at startup (it seats from 144 columns; `/hud` opens it at any width) |
 | `/hud notion on\|off` | Draw Claude's replies Notion-style (off by default) |
 | `/hud bubble on\|off` | Put your own prompts in a rounded bubble (off by default) |
@@ -90,8 +90,8 @@ Four independent pieces. Use any of them.
    { "theme": "custom:notion-dark" }
    ```
    or `custom:notion-light`. Both override only colours (Notion's palette) on top of the built-in dark and light themes.
-3. **Prose width.** `"maxProseWidth": 80` in settings wraps prose to a readable column, like a Notion page. The Notion-style replies use the same width.
-4. **Font.** Notion's own "Mono" page style uses [iA Writer Mono](https://github.com/iaolo/iA-Fonts) (SIL Open Font License). Set it in your terminal with a line height around 1.3.
+3. **Prose width.** `"maxProseWidth": 100` in settings wraps prose to a readable column, like a Notion page (80 is narrower and more Notion-like; 100 fits more). The Notion-style replies use the same width.
+4. **Font.** Notion's own "Mono" page style uses [iA Writer Mono](https://github.com/iaolo/iA-Fonts) (SIL Open Font License). Set it in your terminal; size 13 with a line height of 1.2 fits a lot on screen and still reads comfortably.
 
 A terminal draws text in one size, so headings stand out by weight, colour and spacing rather than size.
 

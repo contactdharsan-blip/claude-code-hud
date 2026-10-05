@@ -84,9 +84,9 @@ function ctxReading(d: HudData): { pct: number; tokens: number; window: number; 
 
 type Seg = { pri: number; side: 'left' | 'right'; order: number; parts: Part[] }
 
-export function bandMode(prefs: HudPrefs, columns: number): 'full' | 'compact' | 'minimal' | 'off' {
+export function bandMode(prefs: HudPrefs, columns: number): 'slim' | 'full' | 'compact' | 'minimal' | 'off' {
   if (prefs.band !== 'auto') return prefs.band
-  return columns >= 110 ? 'full' : columns >= 70 ? 'compact' : 'minimal'
+  return columns >= 70 ? 'slim' : 'minimal'
 }
 
 export function band(ui: UI, d: HudData, columns: number): RenderElement | null {
@@ -95,7 +95,9 @@ export function band(ui: UI, d: HudData, columns: number): RenderElement | null 
   const { Box, Text } = ui
   const now = nowOf(d.live)
   const segs: Seg[] = []
-  const ctxBar = mode === 'full' ? 10 : mode === 'compact' ? 6 : 0
+  // slim is one filled row: bars as wide as full when there is room
+  const wide = mode === 'full' || (mode === 'slim' && columns >= 110)
+  const ctxBar = wide ? 10 : mode === 'compact' || mode === 'slim' ? 6 : 0
 
   // context: kept to the very last as the band narrows
   const ctx = ctxReading(d)
@@ -125,7 +127,7 @@ export function band(ui: UI, d: HudData, columns: number): RenderElement | null 
       order: isFive ? 3 : 4,
       parts: [
         { t: `${limitLabel(lim.kind)} `, dim: true },
-        ...(isFive && mode === 'full' ? [...bar(lim.percentUsed, 6, levelInk(l) ?? INK.running), { t: ' ' }] : []),
+        ...(isFive && wide ? [...bar(lim.percentUsed, 6, levelInk(l) ?? INK.running), { t: ' ' }] : []),
         ...pctParts(lim.percentUsed, l),
         ...(showReset ? [{ t: ` ${GLYPH.reset}${reset}`, dim: true }] : []),
       ],
@@ -176,7 +178,7 @@ export function band(ui: UI, d: HudData, columns: number): RenderElement | null 
   }
 
   const gap = 3
-  const room = columns - (mode === 'minimal' ? 0 : 4)
+  const room = columns - (mode === 'minimal' ? 0 : mode === 'slim' ? 2 : 4)
   const fits = (kept: Seg[]) => {
     const side = (s: 'left' | 'right') => kept.filter(k => k.side === s)
     const sum = (list: Seg[]) => (list.length ? list.reduce((n, k) => n + width(k.parts), 0) + gap * (list.length - 1) : 0)
@@ -199,6 +201,14 @@ export function band(ui: UI, d: HudData, columns: number): RenderElement | null 
 
   const keyline = keylineFor(worst(ctxL, ...d.usage.limits.map(l => level(l.percentUsed))))
 
+  if (mode === 'slim') {
+    return (
+      <Box flexDirection="row" justifyContent="space-between" backgroundColor={INK.card} paddingX={1}>
+        <Box flexDirection="row">{group('left')}</Box>
+        <Box flexDirection="row">{group('right')}</Box>
+      </Box>
+    )
+  }
   if (mode === 'minimal') {
     return (
       <Box flexDirection="row" justifyContent="space-between">
@@ -250,19 +260,54 @@ function row(ui: UI, left: RenderElement, right?: RenderElement | null): RenderE
   )
 }
 
-function card(ui: UI, title: string, meta: string | null, keyline: string, body: RenderElement[]): RenderElement {
+/** A rounded card drawn frame and all, so its title and meta sit on the top
+ * border (`╭─ Title ───── meta ─╮`) and no row is spent on a header. Every body
+ * element is one row (pane rows truncate), which is what makes the sides exact. */
+function card(ui: UI, width: number, title: string, meta: string | null, keyline: string, body: RenderElement[]): RenderElement {
   const { Box, Text } = ui
+  const inner = Math.max(8, width - 2)
+  let head = ` ${title} `
+  let tail = meta ? ` ${meta} ` : ''
+  if (4 + head.length + tail.length > width) tail = ''
+  if (4 + head.length > width) head = head.slice(0, Math.max(0, width - 5)) + '…'
+  const run = Math.max(0, width - 4 - head.length - tail.length)
+  const frame = (t: string) => (
+    <Text color={keyline} backgroundColor={INK.card}>
+      {t}
+    </Text>
+  )
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={keyline} backgroundColor={INK.card} paddingX={1}>
-      {row(ui, <Text bold>{title}</Text>, meta ? <Text dimColor>{meta}</Text> : null)}
-      {body}
+    <Box flexDirection="column" width={width}>
+      <Text>
+        {frame('╭─')}
+        <Text bold backgroundColor={INK.card}>
+          {head}
+        </Text>
+        {frame('─'.repeat(run))}
+        {tail ? (
+          <Text dimColor backgroundColor={INK.card}>
+            {tail}
+          </Text>
+        ) : null}
+        {frame('─╮')}
+      </Text>
+      {body.map(r => (
+        <Box flexDirection="row">
+          {frame('│')}
+          <Box width={inner} paddingX={1} backgroundColor={INK.card}>
+            {r}
+          </Box>
+          {frame('│')}
+        </Box>
+      ))}
+      {frame(`╰${'─'.repeat(inner)}╯`)}
     </Box>
   )
 }
 
 const base = (p: string) => p.split('/').filter(Boolean).pop() ?? p
 
-function sessionCard(ui: UI, d: HudData): RenderElement {
+function sessionCard(ui: UI, d: HudData, width: number): RenderElement {
   const now = nowOf(d.live)
   const g = d.git
   const meta = d.usage.startedAt
@@ -295,7 +340,7 @@ function sessionCard(ui: UI, d: HudData): RenderElement {
       ),
     )
   }
-  return card(ui, 'Session', meta, INK.keyline, body)
+  return card(ui, width, 'Session', meta, INK.keyline, body)
 }
 
 function contextCard(ui: UI, d: HudData, inner: number): RenderElement {
@@ -333,7 +378,7 @@ function contextCard(ui: UI, d: HudData, inner: number): RenderElement {
       ),
     )
   }
-  return card(ui, 'Context', meta, keylineFor(l), body)
+  return card(ui, inner + 4, 'Context', meta, keylineFor(l), body)
 }
 
 function usageCard(ui: UI, d: HudData, inner: number): RenderElement | null {
@@ -358,7 +403,7 @@ function usageCard(ui: UI, d: HudData, inner: number): RenderElement | null {
   if (u.usd !== null) {
     body.push(row(ui, spans(ui, [{ t: 'session cost', dim: true }]), spans(ui, [{ t: fmtUsd(u.usd), bold: true }])))
   }
-  return card(ui, 'Usage', null, keylineFor(worst(...u.limits.map(x => level(x.percentUsed)))), body)
+  return card(ui, inner + 4, 'Usage', null, keylineFor(worst(...u.limits.map(x => level(x.percentUsed)))), body)
 }
 
 const READ_ONLY = new Set(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch', 'ToolSearch'])
@@ -379,7 +424,7 @@ function group(calls: HudCall[]): Grouped[] {
   return out
 }
 
-function activityCard(ui: UI, d: HudData, rows: number): RenderElement | null {
+function activityCard(ui: UI, d: HudData, rows: number, width: number): RenderElement | null {
   if (!d.calls.length) return null
   const now = nowOf(d.live)
   const body = group(d.calls)
@@ -405,10 +450,10 @@ function activityCard(ui: UI, d: HudData, rows: number): RenderElement | null {
       )
     })
   const meta = d.live.isWorking ? `${d.live.toolsThisTurn} this turn` : `${d.calls.length} calls`
-  return card(ui, 'Activity', meta, d.live.isWorking ? INK.running : INK.keyline, body)
+  return card(ui, width, 'Activity', meta, d.live.isWorking ? INK.running : INK.keyline, body)
 }
 
-function tasksCard(ui: UI, d: HudData, rows: number): RenderElement | null {
+function tasksCard(ui: UI, d: HudData, rows: number, width: number): RenderElement | null {
   if (!d.tasks.length) return null
   const done = d.tasks.filter(t => t.status === 'completed').length
   const open = d.tasks.filter(t => t.status !== 'completed')
@@ -423,7 +468,7 @@ function tasksCard(ui: UI, d: HudData, rows: number): RenderElement | null {
       { t: t.text, dim: t.status === 'completed', strike: t.status === 'completed', bold: t.status === 'in_progress' },
     ]),
   )
-  return card(ui, 'Tasks', `${done} / ${d.tasks.length}`, INK.keyline, body)
+  return card(ui, width, 'Tasks', `${done} / ${d.tasks.length}`, INK.keyline, body)
 }
 
 const AGENT_GLYPH: Record<string, Part> = {
@@ -436,7 +481,7 @@ const AGENT_GLYPH: Record<string, Part> = {
   killed: { t: `${GLYPH.denied} `, color: INK.warn },
 }
 
-function agentsCard(ui: UI, d: HudData): RenderElement | null {
+function agentsCard(ui: UI, d: HudData, width: number): RenderElement | null {
   const active = d.agents.filter(a => a.endedAt === null)
   const ended = d.agents.filter(a => a.endedAt !== null).slice(-3)
   if (!active.length && !ended.length) return null
@@ -450,7 +495,7 @@ function agentsCard(ui: UI, d: HudData): RenderElement | null {
         : spans(ui, [{ t: fmtSpan(a.endedAt - a.firstSeen), dim: true }]),
     ),
   )
-  return card(ui, 'Agents', active.length ? `${active.length} running` : `${ended.length} done`, active.length ? INK.running : INK.keyline, body)
+  return card(ui, width, 'Agents', active.length ? `${active.length} running` : `${ended.length} done`, active.length ? INK.running : INK.keyline, body)
 }
 
 const FILE_MARK: Record<string, Part> = {
@@ -461,7 +506,7 @@ const FILE_MARK: Record<string, Part> = {
   R: { t: 'R ', color: INK.warn },
 }
 
-function filesCard(ui: UI, d: HudData, rows: number): RenderElement | null {
+function filesCard(ui: UI, d: HudData, rows: number, width: number): RenderElement | null {
   if (!d.files.length) return null
   const g = d.git
   const body = [...d.files]
@@ -483,20 +528,20 @@ function filesCard(ui: UI, d: HudData, rows: number): RenderElement | null {
           : null,
       )
     })
-  return card(ui, 'Files', String(d.files.length), INK.keyline, body)
+  return card(ui, width, 'Files', String(d.files.length), INK.keyline, body)
 }
 
 export function pane(ui: UI, d: HudData, columns: number): RenderElement {
   const { Box } = ui
   const inner = Math.max(12, columns - 4)
   const cards = [
-    sessionCard(ui, d),
+    sessionCard(ui, d, columns),
     contextCard(ui, d, inner),
     usageCard(ui, d, inner),
-    activityCard(ui, d, 8),
-    tasksCard(ui, d, 8),
-    agentsCard(ui, d),
-    filesCard(ui, d, 6),
+    activityCard(ui, d, 8, columns),
+    tasksCard(ui, d, 8, columns),
+    agentsCard(ui, d, columns),
+    filesCard(ui, d, 6, columns),
   ].filter((c): c is RenderElement => c !== null)
   return <Box flexDirection="column">{cards}</Box>
 }

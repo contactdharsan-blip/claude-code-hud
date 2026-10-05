@@ -150,6 +150,10 @@ describe('drawing', () => {
     await $.turn.start({ text: 'go', turnId: 't1' })
     for (const surface of SURFACES) {
       const wide = await $.ui.mount({ plugin: 'hud', surface, ...BAND(160) })
+      // auto is the slim band: one filled row, no border rows
+      const root = (await wide.drawn()) as { props?: Record<string, unknown> }
+      expect(root.props?.borderStyle).toBeUndefined()
+      expect(root.props?.backgroundColor).toBe('composerSidebarBackground')
       expect(await wide.find({ text: /Opus 5\.5 1M/ })).toBeDefined()
       expect(await wide.find({ text: /^31%$/ })).toBeDefined()
       expect(await wide.find({ text: /main/ })).toBeDefined()
@@ -173,8 +177,10 @@ describe('drawing', () => {
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ plugin: 'hud', surface, ...PANE })
       for (const title of ['Session', 'Context', 'Usage', 'Activity', 'Files']) {
-        expect(await ui.find({ text: title })).toBeDefined()
+        expect(await ui.find({ text: ` ${title} ` })).toBeDefined()
       }
+      // titles ride the top border
+      expect(await ui.find({ text: '╭─' })).toBeDefined()
       expect(await ui.find({ text: 'Tasks' })).toBeUndefined()
       expect(await ui.find({ text: 'Agents' })).toBeUndefined()
       expect(await ui.find({ text: / state\.py ×2$/ })).toBeDefined()

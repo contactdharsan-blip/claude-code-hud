@@ -1,6 +1,6 @@
 {
   "name": "hud",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "App-like heads-up display for the Claude Code terminal: a status band above the prompt, a docked pane of rounded cards, and opt-in Notion-style replies",
   "author": {
     "name": "Dharsan Kesavan"

@@ -24,7 +24,7 @@ const MAX_CALLS = 60
 const WRITES = new Set(['Edit', 'Write', 'NotebookEdit'])
 const GIT_TOUCHING = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash'])
 const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'])
-const BAND_MODES: HudBandMode[] = ['auto', 'full', 'compact', 'minimal', 'off']
+const BAND_MODES: HudBandMode[] = ['auto', 'slim', 'full', 'compact', 'minimal', 'off']
 
 /** Swallows a collector's failure: the HUD degrades, the session never does. */
 const quietly = (work: Promise<unknown>) => {
@@ -314,7 +314,7 @@ export const register: Register = on => {
     await $.command.register({
       name: 'hud',
       description: 'HUD: toggle the inspector pane, or set the band, auto-open and prompt bubble',
-      argumentHint: '[band auto|full|compact|minimal|off] [auto|bubble|notion on|off] [status]',
+      argumentHint: '[band auto|slim|full|compact|minimal|off] [auto|bubble|notion on|off] [status]',
       immediate: true,
     })
     if ((await $.session.surfaces()).length > 0) quietly(activate($))
@@ -468,7 +468,7 @@ export const register: Register = on => {
       }
     }
     return {
-      text: 'Usage: /hud (toggle pane) · /hud band auto|full|compact|minimal|off · /hud auto on|off · /hud bubble on|off · /hud notion on|off · /hud status',
+      text: 'Usage: /hud (toggle pane) · /hud band auto|slim|full|compact|minimal|off · /hud auto on|off · /hud bubble on|off · /hud notion on|off · /hud status',
     }
   })
 }

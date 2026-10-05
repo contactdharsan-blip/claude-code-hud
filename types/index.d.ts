@@ -63,7 +63,7 @@ export type HudLive = {
   now: number
 }
 
-export type HudBandMode = 'auto' | 'full' | 'compact' | 'minimal' | 'off'
+export type HudBandMode = 'auto' | 'slim' | 'full' | 'compact' | 'minimal' | 'off'
 
 export type HudPrefs = { band: HudBandMode; paneAuto: boolean; bubble: boolean; notion: boolean }
 
