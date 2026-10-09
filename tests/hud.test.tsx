@@ -33,6 +33,12 @@ const TODO_V1 = [
   '- [ ] Worktree, tests, verifier',
 ].join('\n')
 
+/** `$.tool.call` without its per-tool typing, which tsc resolves against every
+ * tool the machine declares (MCP ones included) and gives up on as too deep. */
+function callTool($: { tool: unknown }, input: Record<string, unknown>): Promise<unknown> {
+  return ($.tool as { call: (input: object) => Promise<unknown> }).call(input)
+}
+
 /** A promise the test releases: holds a tool call open the way a real launch
  * does, so what the call starts happens inside it. */
 function gate() {
@@ -218,9 +224,9 @@ describe('drawing', () => {
     on('tool.call', () => ({ result: {} }) as never)
     await $.command.run(run('hud', 'status'))
     await $.turn.start({ text: 'go', turnId: 't1' })
-    await $.tool.call({ tool: 'Read', tool_use_id: 'a', file_path: '/repo/tokens.css' } as never)
-    await $.tool.call({ tool: 'Read', tool_use_id: 'b', file_path: '/repo/state.py' } as never)
-    await $.tool.call({ tool: 'Edit', tool_use_id: 'c', file_path: '/repo/state.py', old_string: 'a', new_string: 'b' } as never)
+    await callTool($, { tool: 'Read', tool_use_id: 'a', file_path: '/repo/tokens.css' })
+    await callTool($, { tool: 'Read', tool_use_id: 'b', file_path: '/repo/state.py' })
+    await callTool($, { tool: 'Edit', tool_use_id: 'c', file_path: '/repo/state.py', old_string: 'a', new_string: 'b' })
     for (const surface of SURFACES) {
       const ui = await $.ui.mount({ plugin: 'hud', surface, ...PANE })
       for (const title of ['Session', 'Context', 'Usage', 'Activity', 'Files']) {
@@ -264,13 +270,13 @@ describe('drawing', () => {
       { content: 'Write plan', status: 'in_progress', activeForm: 'Writing plan' },
       { content: 'Verify', status: 'pending', activeForm: 'Verifying' },
     ]
-    await $.tool.call({ tool: 'TodoWrite', tool_use_id: 't1', todos } as never)
-    await $.tool.call({
+    await callTool($, { tool: 'TodoWrite', tool_use_id: 't1', todos })
+    await callTool($, {
       tool: 'TodoWrite',
       tool_use_id: 't2',
       agentId: 'sub1',
       todos: [{ content: 'subagent step', status: 'pending', activeForm: 'x' }],
-    } as never)
+    })
     const ui = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...PANE })
     expect(await ui.find({ text: '1 / 3' })).toBeDefined()
     expect(await ui.find({ text: 'Writing plan' })).toBeDefined()
@@ -310,7 +316,7 @@ describe('drawing', () => {
     await $.command.run(run('hud', 'status'))
     // the Agent call asks for a worktree; its spawn happens inside the call and
     // carries the same tool_use_id
-    const call = $.tool.call({ tool: 'Agent', tool_use_id: 'tu1', description: 'find the config', prompt: 'p', subagent_type: 'scout', isolation: 'worktree' } as never)
+    const call = callTool($, { tool: 'Agent', tool_use_id: 'tu1', description: 'find the config', prompt: 'p', subagent_type: 'scout', isolation: 'worktree' })
     await reached.shut
     const started = await $.agent.spawn({
       tool_use_id: 'tu1',
@@ -354,7 +360,7 @@ describe('drawing', () => {
       await ui.unmount()
     }
     todo = `${TODO_V1}\n- [ ] Rebuild the sidecar`
-    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/repo/tasks/todo.md', old_string: 'a', new_string: 'b' } as never)
+    await callTool($, { tool: 'Edit', tool_use_id: 'e1', file_path: '/repo/tasks/todo.md', old_string: 'a', new_string: 'b' })
     const ui = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...PANE })
     expect(await ui.find({ text: ' 4 open ' })).toBeDefined()
     expect(await ui.find({ text: 'Rebuild the sidecar' })).toBeDefined()
@@ -369,7 +375,7 @@ describe('drawing', () => {
     await $.command.run(run('hud', 'status'))
     await $.turn.start({ text: 'review it', turnId: 'main' })
     const script = "export const meta = { name: 'review-changes', description: 'Review the diff' }\nawait agent('look')"
-    await $.tool.call({ tool: 'Workflow', tool_use_id: 'wf1', script } as never)
+    await callTool($, { tool: 'Workflow', tool_use_id: 'wf1', script })
     const spawn = (description: string, subagentType: string, agentIndex: number) =>
       $.agent.spawn({
         tool_use_id: 'wf1',

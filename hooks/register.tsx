@@ -14,7 +14,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { HudAgent, HudBandMode, HudCall, HudFlowAgent, HudLive, HudPrefs, HudSpawn, HudTask, HudUsage } from '../types'
+import type { HudAgent, HudBandMode, HudCall, HudCallStatus, HudFlowAgent, HudLive, HudPrefs, HudSpawn, HudTask, HudUsage } from '../types'
 import { callLabel, categoryName, fmtTokens, parseNumstat, parsePorcelain, parseTodo, workflowName } from './format'
 import { band, bubble, hintTail, notionReply, pane, type HudData } from './view'
 
@@ -446,7 +446,7 @@ export const register: Register = on => {
     const ran = await next(e).finally(() => worktreeCalls.delete(e.tool_use_id))
 
     try {
-      const status = ran.deny !== undefined ? 'denied' : ran.isError ? 'error' : 'ok'
+      const status: HudCallStatus = ran.deny !== undefined ? 'denied' : ran.isError ? 'error' : 'ok'
       const endedAt = await now($)
       await update($, callsAtom, list => list.map(c => (c.id === call.id ? { ...c, status, endedAt } : c)))
       if (status === 'ok') {
