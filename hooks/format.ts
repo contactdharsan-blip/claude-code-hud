@@ -45,6 +45,64 @@ export function fmtModel(id: string): string {
   return `${family} ${m[2]}${m[3] !== undefined ? `.${m[3]}` : ''}${big}`
 }
 
+/** `claude-haiku-4-5-20251001` → `haiku`; an alias (`opus`) stays itself. */
+export function modelFamily(id: string): string {
+  return (/claude-([a-z]+)/i.exec(id)?.[1] ?? id.replace(/\[[^\]]*\]$/, '')).toLowerCase()
+}
+
+const COST: Record<string, number> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 }
+
+/** How many agents run on each model family, cheapest first: `haiku 2 · opus 1`. */
+export function tierTally(models: string[]): string {
+  const counts = new Map<string, number>()
+  for (const m of models) counts.set(modelFamily(m), (counts.get(modelFamily(m)) ?? 0) + 1)
+  return [...counts]
+    .sort(([a], [z]) => (COST[a] ?? 9) - (COST[z] ?? 9) || a.localeCompare(z))
+    .map(([f, n]) => `${f} ${n}`)
+    .join(' · ')
+}
+
+const plainMd = (s: string) =>
+  s
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\*\*|__|`/g, '')
+    .trim()
+
+/** A markdown checklist's counts and its last `keep` open items (`- [ ]`), each
+ * under the nearest heading above it. Fenced code is skipped, so an example
+ * checklist inside a fence is not a task. */
+export function parseTodo(md: string, keep: number): { open: number; done: number; items: { section: string; text: string }[] } {
+  let section = ''
+  let fence = false
+  let done = 0
+  const items: { section: string; text: string }[] = []
+  for (const line of md.split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fence = !fence
+      continue
+    }
+    if (fence) continue
+    const h = /^#{1,6}\s+(.*)$/.exec(line)
+    if (h) {
+      section = plainMd(h[1] ?? '')
+      continue
+    }
+    const c = /^\s*[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(line)
+    if (!c) continue
+    if (c[1] === ' ') items.push({ section, text: plainMd(c[2] ?? '') })
+    else done += 1
+  }
+  return { open: items.length, done, items: items.slice(-keep) }
+}
+
+/** A Workflow call's name: a saved workflow's `name`, else the script's
+ * `meta.name` (the first `name:` in it, since a script begins with its meta). */
+export function workflowName(input: Record<string, unknown>): string | null {
+  if (typeof input.name === 'string' && input.name) return input.name
+  if (typeof input.script !== 'string') return null
+  return /\bname\s*:\s*['"`]([^'"`\n]+)['"`]/.exec(input.script)?.[1] ?? null
+}
+
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
 
 /** A bar `width` cells wide at `pct`, split so each part can take its own colour. */

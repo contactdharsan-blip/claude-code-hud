@@ -2,8 +2,11 @@
 
 A heads-up display for the Claude Code terminal that makes it read more like an app:
 
-- a **band above the prompt** with the numbers worth a glance: model, context, rate limits with reset countdowns, session cost, git branch and the running turn
-- an **inspector pane** docked beside the transcript, made of rounded cards: Session, Context, Usage, Activity, Tasks, Agents and Files (a card with nothing to say stays hidden)
+- a **band above the prompt** with the numbers worth a glance: model, context, rate limits with reset countdowns, session cost, git branch, the running turn and the agents at work
+- an **inspector pane** docked beside the transcript, made of rounded cards: Session, Context, Usage, Activity, Tasks, Todo, Agents, Workflow and Files (a card with nothing to say stays hidden)
+- **agents by the model they actually run on**: each agent's role, its model family after any routing hook (`scout haiku`) and `⎇` when it runs in its own worktree; the band tallies the running ones, a workflow's included (`↳ 3 agents haiku 2 · opus 1`)
+- the **Workflow card**: the latest workflow run by name, each of its agents with its model, running or done, and `done / started` in the title (a workflow's agents never appear in the Agents card); a finished run steps aside after 15 minutes
+- the **Todo card**: the last open `- [ ]` items of the repository's `tasks/todo.md`, under their headings, with the open count
 - optional **Notion-style replies**: bullets, to-dos, quote bars, callouts and inline-code pills instead of raw markdown punctuation
 - two **Notion themes** (dark and light) for Claude Code itself
 
@@ -98,6 +101,7 @@ A terminal draws text in one size, so headings stand out by weight, colour and s
 ## What it reads, and what it costs
 
 - **No network and no model calls.** Context, rate limits and cost come from the session's own figures. The context breakdown uses Claude Code's local estimate, which sends no requests.
+- **`tasks/todo.md`, read-only:** at the repository root (the working directory outside a repository), at startup, at the end of each turn and after an edit to it.
 - **Git, read-only:** `rev-parse`, `status --porcelain=v2` and `diff --numstat HEAD`, always with `--no-optional-locks`, so it never takes the index lock from under a git command Claude is running. It runs at startup, at the end of each turn, and shortly after an edit or shell command. Never on an idle timer.
 - **Headless runs (`claude -p`, scripts, CI)** load the mod but it stays passive until something draws, so they pay only a few pass-through hooks.
 - **Timers:** one, ticking every second while a turn or an agent runs (for elapsed times) and every 30 seconds otherwise (for reset countdowns).

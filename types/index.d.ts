@@ -46,6 +46,14 @@ export type HudCall = {
 
 export type HudTask = { id: string; text: string; status: 'pending' | 'in_progress' | 'completed' }
 
+/** What an agent's spawn said that `$.agent.list()` does not. */
+export type HudSpawn = {
+  /** The model it runs on, as the spawn resolved it (after any routing hook). */
+  model: string
+  /** Runs in a git worktree of its own. */
+  worktree: boolean
+}
+
 export type HudAgent = {
   id: string
   type: string
@@ -53,6 +61,37 @@ export type HudAgent = {
   status: string
   firstSeen: number
   endedAt: number | null
+  /** Null when the HUD did not see it start (it began before a reload). */
+  spawn: HudSpawn | null
+}
+
+/** The open items of the project's `tasks/todo.md`, newest last. */
+export type HudTodo = {
+  path: string
+  open: number
+  done: number
+  /** The last few open items, each under the heading it sits in. */
+  items: { section: string; text: string }[]
+} | null
+
+/** One agent of a workflow run, which `$.agent.list()` never shows. */
+export type HudFlowAgent = {
+  agentId: string
+  type: string
+  model: string
+  description: string
+  startedAt: number
+  endedAt: number | null
+  failed: boolean
+}
+
+/** One workflow run, by its `wf_` id, with the agents it started so far. */
+export type HudFlow = {
+  runId: string
+  /** The script's `meta.name`, or a saved workflow's name, when the call gave one. */
+  name: string | null
+  startedAt: number
+  agents: HudFlowAgent[]
 }
 
 export type HudLive = {
@@ -76,7 +115,10 @@ declare module 'claude-code' {
       calls: HudCall[]
       tasks: HudTask[]
       agents: HudAgent[]
+      spawns: Record<string, HudSpawn>
+      flows: HudFlow[]
       files: string[]
+      todo: HudTodo
       live: HudLive
       prefs: HudPrefs
       paneOpened: boolean

@@ -14,13 +14,19 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
-import type { HudAgent, HudBandMode, HudCall, HudLive, HudPrefs, HudTask, HudUsage } from '../types'
-import { callLabel, categoryName, fmtTokens, parseNumstat, parsePorcelain } from './format'
+import type { HudAgent, HudBandMode, HudCall, HudFlowAgent, HudLive, HudPrefs, HudSpawn, HudTask, HudUsage } from '../types'
+import { callLabel, categoryName, fmtTokens, parseNumstat, parsePorcelain, parseTodo, workflowName } from './format'
 import { band, bubble, hintTail, notionReply, pane, type HudData } from './view'
 
 type $ = EngineInterface
 
 const MAX_CALLS = 60
+const MAX_SPAWNS = 60
+const MAX_FLOWS = 3
+const MAX_FLOW_AGENTS = 40
+// The plan file the global workflow keeps, relative to the repository root.
+const TODO_FILE = 'tasks/todo.md'
+const TODO_ROWS = 6
 const WRITES = new Set(['Edit', 'Write', 'NotebookEdit'])
 const GIT_TOUCHING = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash'])
 const TASK_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'])
@@ -59,7 +65,10 @@ const gitAtom = atom({ plugin: 'hud', key: 'git' } as const, null)
 const callsAtom = atom({ plugin: 'hud', key: 'calls' } as const, [])
 const tasksAtom = atom({ plugin: 'hud', key: 'tasks' } as const, [])
 const agentsAtom = atom({ plugin: 'hud', key: 'agents' } as const, [])
+const spawnsAtom = atom({ plugin: 'hud', key: 'spawns' } as const, {})
+const flowsAtom = atom({ plugin: 'hud', key: 'flows' } as const, [])
 const filesAtom = atom({ plugin: 'hud', key: 'files' } as const, [])
+const todoAtom = atom({ plugin: 'hud', key: 'todo' } as const, null)
 const liveAtom = atom({ plugin: 'hud', key: 'live' } as const, IDLE)
 const prefsAtom = atom({ plugin: 'hud', key: 'prefs' } as const, DEFAULT_PREFS)
 const paneOpenedAtom = atom({ plugin: 'hud', key: 'paneOpened' } as const, false)
@@ -128,12 +137,22 @@ async function refreshGit($: $): Promise<void> {
   if (!same(await read($, gitAtom), value)) await update($, gitAtom, () => value)
 }
 
+/** The repository's `tasks/todo.md` (the working directory's when there is no
+ * repository): read at activation, at the end of each turn, and after a write
+ * to it. A missing file hides the card. */
+async function refreshTodo($: $): Promise<void> {
+  const root = (await read($, gitAtom))?.root ?? (await $.session.cwd())
+  const path = `${root}/${TODO_FILE}`
+  const text = await $.fs.read(path).catch(() => null)
+  const value = typeof text === 'string' ? { path, ...parseTodo(text, TODO_ROWS) } : null
+  if (!same(await read($, todoAtom), value)) await update($, todoAtom, () => value)
+}
+
 const ACTIVE = new Set(['pending', 'running', 'waiting'])
 
 /** Returns whether any agent is still active, so the caller knows to keep polling. */
 async function refreshAgents($: $, at: number): Promise<boolean> {
-  const listed = await $.agent.list()
-  const held = await read($, agentsAtom)
+  const [listed, held, spawns, flows] = await Promise.all([$.agent.list(), read($, agentsAtom), read($, spawnsAtom), read($, flowsAtom)])
   const before = new Map(held.map(a => [a.id, a]))
   const next: HudAgent[] = listed.map(a => {
     const was = before.get(a.id)
@@ -145,10 +164,12 @@ async function refreshAgents($: $, at: number): Promise<boolean> {
       status: a.status,
       firstSeen: was?.firstSeen ?? at,
       endedAt: isActive ? null : (was?.endedAt ?? at),
+      spawn: spawns[a.id] ?? null,
     }
   })
   if (!same(held, next)) await update($, agentsAtom, () => next)
-  return next.some(a => ACTIVE.has(a.status))
+  // A workflow's agents are not in the list, and keep the clock running too.
+  return next.some(a => ACTIVE.has(a.status)) || flows.some(f => f.agents.some(a => a.endedAt === null))
 }
 
 type Todo = { content: string; status: HudTask['status']; activeForm: string }
@@ -191,6 +212,30 @@ async function noteTasks($: $, tool: string, input: Record<string, unknown>, res
   }
 }
 
+/** Keeps what a spawn said about its agent, which the agent list never carries:
+ * the model it resolved to (after any routing hook beneath), and how it runs. */
+async function noteSpawn($: $, agentId: string, spawn: HudSpawn): Promise<void> {
+  await update($, spawnsAtom, held => Object.fromEntries([...Object.entries(held).filter(([id]) => id !== agentId), [agentId, spawn]].slice(-MAX_SPAWNS)))
+}
+
+/** Adds a workflow agent to its run, opening the run on its first agent. */
+async function noteFlowAgent($: $, runId: string, name: string | null, agent: HudFlowAgent): Promise<void> {
+  await update($, flowsAtom, runs => {
+    const run = runs.find(r => r.runId === runId) ?? { runId, name, startedAt: agent.startedAt, agents: [] }
+    const agents = [...run.agents.filter(a => a.agentId !== agent.agentId), agent].slice(-MAX_FLOW_AGENTS)
+    return [...runs.filter(r => r.runId !== runId), { ...run, name: run.name ?? name, agents }].slice(-MAX_FLOWS)
+  })
+}
+
+/** Closes a workflow agent when its loop completes; any other loop is no concern of this. */
+async function endFlowAgent($: $, agentId: string, at: number, failed: boolean): Promise<void> {
+  const runs = await read($, flowsAtom)
+  if (!runs.some(r => r.agents.some(a => a.agentId === agentId && a.endedAt === null))) return
+  await update($, flowsAtom, list =>
+    list.map(r => ({ ...r, agents: r.agents.map(a => (a.agentId === agentId && a.endedAt === null ? { ...a, endedAt: at, failed } : a)) })),
+  )
+}
+
 /** Remembers a file the session wrote, newest last, at most 30. */
 async function noteFile($: $, path: string): Promise<void> {
   if (!path) return
@@ -206,6 +251,12 @@ let agentsBusy = false
 let ticks = 0
 let tickMs = 0
 let ticker: Timer | null = null
+// Agent calls that asked for a worktree, by tool_use_id: `isolation` is on the
+// tool's input alone, and the spawn it raises carries the same id.
+const worktreeCalls = new Set<string>()
+// Workflow calls' names, by tool_use_id: the call returns at once and its agents
+// start later, each spawn carrying the call's id. The last few only.
+const flowNames = new Map<string, string>()
 let gitTimer: Timer | null = null
 let home: string | null = null
 // The prose column of a Notion-style reply: settings' maxProseWidth, else 80.
@@ -270,7 +321,9 @@ async function activate($: $): Promise<void> {
     // Each collector fails alone: a missing or slow git must not cost the rest.
     await Promise.allSettled([
       refreshUsage($),
-      refreshGit($),
+      refreshGit($)
+        .catch(() => undefined)
+        .then(() => refreshTodo($)),
       now($)
         .then(t => refreshAgents($, t))
         .then(b => {
@@ -295,18 +348,20 @@ async function activate($: $): Promise<void> {
 }
 
 async function data($: $): Promise<HudData> {
-  const [usage, breakdown, git, calls, tasks, agents, files, live, prefs] = await Promise.all([
+  const [usage, breakdown, git, calls, tasks, agents, flows, files, todo, live, prefs] = await Promise.all([
     read($, usageAtom),
     read($, breakdownAtom),
     read($, gitAtom),
     read($, callsAtom),
     read($, tasksAtom),
     read($, agentsAtom),
+    read($, flowsAtom),
     read($, filesAtom),
+    read($, todoAtom),
     read($, liveAtom),
     read($, prefsAtom),
   ])
-  return { usage, breakdown, git, calls, tasks, agents, files, live, prefs, home }
+  return { usage, breakdown, git, calls, tasks, agents, flows, files, todo, live, prefs, home }
 }
 
 export const register: Register = on => {
@@ -343,11 +398,13 @@ export const register: Register = on => {
       await update($, liveAtom, l => ({ ...l, isWorking: false, turnId: null, now: t }))
       working = false
     }
+    if (active && e.agentId !== undefined) quietly(endFlowAgent($, e.agentId, t, e.isAborted || e.reason === 'refusal'))
     if (active) {
       retime($)
       quietly(refreshUsage($))
       quietly(refreshBreakdown($))
       quietly(refreshGit($))
+      quietly(refreshTodo($))
       quietly(
         refreshAgents($, t).then(b => {
           agentsBusy = b
@@ -373,11 +430,20 @@ export const register: Register = on => {
     await update($, callsAtom, list => [...list, call].slice(-MAX_CALLS))
     if (!call.isSubagent) await update($, liveAtom, l => ({ ...l, toolsThisTurn: l.toolsThisTurn + 1 }))
     if (e.tool === 'Agent') {
+      if (input.isolation === 'worktree') worktreeCalls.add(e.tool_use_id)
       agentsBusy = true
       retime($)
     }
+    if (e.tool === 'Workflow') {
+      const name = workflowName(input)
+      if (name) {
+        flowNames.set(e.tool_use_id, name)
+        for (const id of [...flowNames.keys()].slice(0, -10)) flowNames.delete(id)
+      }
+    }
 
-    const ran = await next(e)
+    // Its spawn, if any, has happened by the time the call returns.
+    const ran = await next(e).finally(() => worktreeCalls.delete(e.tool_use_id))
 
     try {
       const status = ran.deny !== undefined ? 'denied' : ran.isError ? 'error' : 'ok'
@@ -389,6 +455,7 @@ export const register: Register = on => {
         if (WRITES.has(e.tool)) {
           const path = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : ''
           await noteFile($, path)
+          if (path.endsWith(`/${TODO_FILE}`)) quietly(refreshTodo($))
         }
       }
       if (GIT_TOUCHING.has(e.tool)) gitSoon($)
@@ -397,6 +464,40 @@ export const register: Register = on => {
       // The tool's result stands whatever the HUD failed to record.
     }
     return ran
+  })
+
+  on('agent.spawn', async ($, e, next) => {
+    const started = await next(e)
+    const isWorktree = worktreeCalls.delete(e.tool_use_id)
+    if (!active || !started.agentId) return started
+    const agentId = started.agentId
+    try {
+      await noteSpawn($, agentId, { model: started.model, worktree: isWorktree })
+      if (e.workflow) {
+        await noteFlowAgent($, e.workflow.runId, flowNames.get(e.tool_use_id) ?? null, {
+          agentId,
+          type: e.subagentType,
+          model: started.model,
+          description: e.description,
+          startedAt: await now($),
+          endedAt: null,
+          failed: false,
+        })
+      }
+      agentsBusy = true
+      retime($)
+      quietly(
+        now($)
+          .then(t => refreshAgents($, t))
+          .then(b => {
+            agentsBusy = b
+            retime($)
+          }),
+      )
+    } catch {
+      // The agent started whatever the HUD failed to record.
+    }
+    return started
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

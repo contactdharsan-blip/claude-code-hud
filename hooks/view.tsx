@@ -3,7 +3,7 @@
 
 import type { Elements, RenderElement } from 'claude-code'
 
-import type { HudAgent, HudBreakdown, HudCall, HudGit, HudLive, HudPrefs, HudTask, HudUsage } from '../types'
+import type { HudAgent, HudBreakdown, HudCall, HudFlow, HudGit, HudLive, HudPrefs, HudTask, HudTodo, HudUsage } from '../types'
 import {
   barParts,
   fmtClock,
@@ -12,7 +12,9 @@ import {
   fmtTokens,
   fmtUsd,
   level,
+  modelFamily,
   relPath,
+  tierTally,
   toolName,
   worst,
   type Level,
@@ -30,7 +32,9 @@ export type HudData = {
   calls: HudCall[]
   tasks: HudTask[]
   agents: HudAgent[]
+  flows: HudFlow[]
   files: string[]
+  todo: HudTodo
   live: HudLive
   prefs: HudPrefs
   home: string | null
@@ -174,6 +178,25 @@ export function band(ui: UI, d: HudData, columns: number): RenderElement | null 
       side: 'left',
       order: 1,
       parts: [{ t: `${GLYPH.model} `, color: INK.accent }, { t: fmtModel(d.usage.model), bold: true }],
+    })
+  }
+
+  // agents at work (a workflow's too), by the model each one actually runs on
+  const running = [
+    ...d.agents.filter(a => a.endedAt === null).map(a => a.spawn?.model ?? null),
+    ...d.flows.flatMap(f => f.agents.filter(a => a.endedAt === null).map(a => a.model)),
+  ]
+  if (running.length) {
+    const tally = tierTally(running.filter((m): m is string => m !== null))
+    segs.push({
+      pri: 5.5,
+      side: 'right',
+      order: 7,
+      parts: [
+        { t: `${GLYPH.sub} `, color: INK.running },
+        { t: `${running.length} agent${running.length === 1 ? '' : 's'}` },
+        ...(mode !== 'minimal' && tally ? [{ t: ` ${tally}`, dim: true }] : []),
+      ],
     })
   }
 
@@ -471,6 +494,60 @@ function tasksCard(ui: UI, d: HudData, rows: number, width: number): RenderEleme
   return card(ui, width, 'Tasks', `${done} / ${d.tasks.length}`, INK.keyline, body)
 }
 
+// A finished run stays on show this long, then the card steps aside.
+const FLOW_LINGER_MS = 15 * 60_000
+
+/** The latest workflow run: its agents, running first, by the model each runs on. */
+function workflowCard(ui: UI, d: HudData, rows: number, width: number): RenderElement | null {
+  const run = d.flows.at(-1)
+  if (!run?.agents.length) return null
+  const now = nowOf(d.live)
+  const active = run.agents.filter(a => a.endedAt === null)
+  const ended = run.agents.filter(a => a.endedAt !== null)
+  const lastEnd = Math.max(...ended.map(a => a.endedAt ?? 0))
+  if (!active.length && now - lastEnd > FLOW_LINGER_MS) return null
+  const shown = [...active, ...ended.slice(-Math.max(0, rows - active.length))].slice(0, rows)
+  const body = [
+    spans(ui, [{ t: run.name ?? run.runId, dim: true }]),
+    ...shown.map(a =>
+      row(
+        ui,
+        spans(ui, [
+          a.endedAt === null
+            ? { t: `${GLYPH.running} `, color: INK.running }
+            : a.failed
+              ? { t: `${GLYPH.error} `, color: INK.bad }
+              : { t: `${GLYPH.ok} `, color: INK.ok },
+          { t: a.type, bold: true },
+          { t: ` ${modelFamily(a.model)}`, dim: true },
+          { t: ` ${a.description}`, dim: a.endedAt !== null },
+        ]),
+        a.endedAt === null
+          ? spans(ui, [{ t: fmtClock(now - a.startedAt), color: INK.running }])
+          : spans(ui, [{ t: fmtSpan(a.endedAt - a.startedAt), dim: true }]),
+      ),
+    ),
+    ...(run.agents.length > shown.length ? [spans(ui, [{ t: `+${run.agents.length - shown.length} more`, dim: true }])] : []),
+  ]
+  return card(ui, width, 'Workflow', `${ended.length} / ${run.agents.length}`, active.length ? INK.running : INK.keyline, body)
+}
+
+/** The project's `tasks/todo.md`: its last open items, under their headings. */
+function todoCard(ui: UI, d: HudData, width: number): RenderElement | null {
+  const t = d.todo
+  if (!t?.items.length) return null
+  const body: RenderElement[] = []
+  let section: string | null = null
+  for (const item of t.items) {
+    if (item.section !== section) {
+      section = item.section
+      if (section) body.push(spans(ui, [{ t: section, dim: true }]))
+    }
+    body.push(spans(ui, [{ t: `${GLYPH.pending} `, dim: true }, { t: item.text }]))
+  }
+  return card(ui, width, 'Todo', `${t.open} open`, INK.keyline, body)
+}
+
 const AGENT_GLYPH: Record<string, Part> = {
   running: { t: `${GLYPH.running} `, color: INK.running },
   pending: { t: `${GLYPH.pending} `, color: INK.running },
@@ -489,7 +566,14 @@ function agentsCard(ui: UI, d: HudData, width: number): RenderElement | null {
   const body = [...active, ...ended].map(a =>
     row(
       ui,
-      spans(ui, [AGENT_GLYPH[a.status] ?? { t: `${GLYPH.pending} `, dim: true }, { t: a.type, bold: true }, { t: ` ${a.description}`, dim: a.endedAt !== null }]),
+      spans(ui, [
+        AGENT_GLYPH[a.status] ?? { t: `${GLYPH.pending} `, dim: true },
+        { t: a.type, bold: true },
+        // what it runs on, and whether in a worktree of its own
+        ...(a.spawn ? [{ t: ` ${modelFamily(a.spawn.model)}`, dim: true }] : []),
+        ...(a.spawn?.worktree ? [{ t: ` ${GLYPH.branch}`, dim: true }] : []),
+        { t: ` ${a.description}`, dim: a.endedAt !== null },
+      ]),
       a.endedAt === null
         ? spans(ui, [{ t: fmtClock(now - a.firstSeen), color: INK.running }])
         : spans(ui, [{ t: fmtSpan(a.endedAt - a.firstSeen), dim: true }]),
@@ -540,7 +624,9 @@ export function pane(ui: UI, d: HudData, columns: number): RenderElement {
     usageCard(ui, d, inner),
     activityCard(ui, d, 8, columns),
     tasksCard(ui, d, 8, columns),
+    todoCard(ui, d, columns),
     agentsCard(ui, d, columns),
+    workflowCard(ui, d, 8, columns),
     filesCard(ui, d, 6, columns),
   ].filter((c): c is RenderElement => c !== null)
   return <Box flexDirection="column">{cards}</Box>

@@ -1,7 +1,7 @@
-import type { On } from 'claude-code'
+import type { AgentInfo, On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { barParts, callLabel, fmtModel, fmtSpan, fmtTokens, parseNumstat, parsePorcelain } from '../hooks/format'
+import { barParts, callLabel, fmtModel, fmtSpan, fmtTokens, modelFamily, parseNumstat, parsePorcelain, parseTodo, tierTally, workflowName } from '../hooks/format'
 import { displayWidth, parseBlocks, parseInline, plain, wrapRuns } from '../hooks/notion'
 
 const SURFACES = ['terminal', 'desktop'] as const
@@ -18,6 +18,27 @@ const USAGE = {
     { kind: 'seven_day', percentUsed: 88, resetsAt: '2030-01-04T09:00:00Z' },
   ],
   usd: 3.12,
+}
+
+const TODO_V1 = [
+  '# Old goal',
+  '- [x] shipped',
+  '- [ ] **left** over from `before`',
+  '```',
+  '- [ ] an example, not a task',
+  '```',
+  '## Brief via SMTP',
+  '- [x] plan it',
+  '- [ ] Store the [app password](https://example.com) in the Keychain',
+  '- [ ] Worktree, tests, verifier',
+].join('\n')
+
+/** A promise the test releases: holds a tool call open the way a real launch
+ * does, so what the call starts happens inside it. */
+function gate() {
+  let open = () => {}
+  const shut = new Promise<void>(r => (open = r))
+  return { shut, open }
 }
 
 const BAND = (bodyColumns: number) => ({
@@ -50,6 +71,10 @@ describe('format', () => {
     expect(fmtModel('claude-opus-5-5[1m]')).toBe('Opus 5.5 1M')
     expect(fmtModel('claude-haiku-4-5-20251001')).toBe('Haiku 4.5')
     expect(fmtModel('claude-fable-5')).toBe('Fable 5')
+    expect(modelFamily('claude-haiku-4-5-20251001')).toBe('haiku')
+    expect(modelFamily('claude-opus-5-5[1m]')).toBe('opus')
+    expect(modelFamily('sonnet')).toBe('sonnet')
+    expect(tierTally(['claude-opus-5', 'claude-haiku-4-5-20251001', 'haiku', 'claude-fable-5'])).toBe('haiku 2 · opus 1 · fable 1')
   })
 
   test('a bar fills its width exactly, with an eighth-block edge', () => {
@@ -58,6 +83,23 @@ describe('format', () => {
       expect(full.length + partial.length + empty.length).toBe(10)
     }
     expect(barParts(31, 10)).toEqual({ full: '███', partial: '▏', empty: '      ' })
+  })
+
+  test('a todo file gives its counts and its last open items under their headings; fences are not tasks', () => {
+    const t = parseTodo(TODO_V1, 2)
+    expect([t.open, t.done]).toEqual([3, 2])
+    expect(t.items).toEqual([
+      { section: 'Brief via SMTP', text: 'Store the app password in the Keychain' },
+      { section: 'Brief via SMTP', text: 'Worktree, tests, verifier' },
+    ])
+    expect(parseTodo(TODO_V1, 9).items[0]).toEqual({ section: 'Old goal', text: 'left over from before' })
+    expect(parseTodo('no checklist here', 5)).toEqual({ open: 0, done: 0, items: [] })
+  })
+
+  test("a workflow's name comes from a saved name or the script's meta", () => {
+    expect(workflowName({ name: 'nightly' })).toBe('nightly')
+    expect(workflowName({ script: "export const meta = {\n  name: 'review-changes',\n  description: 'x' }" })).toBe('review-changes')
+    expect(workflowName({ script: 'agent("go")' })).toBeNull()
   })
 
   test('tool calls get a one-line subject', () => {
@@ -93,7 +135,7 @@ describe('format', () => {
 /** Answers, from beneath the plugin, what a real session would: its usage,
  * model, surfaces, cwd, git and agents. The mod's own collectors then fill its
  * state exactly as in a session. */
-function session(on: On, opts: { usage?: Partial<typeof USAGE> } = {}) {
+function session(on: On, opts: { usage?: Partial<typeof USAGE>; agents?: AgentInfo[]; todo?: () => string | undefined } = {}) {
   const u = { ...USAGE, ...opts.usage }
   mock.store(on)
   mock.env(on, { HOME: '/Users/owner' })
@@ -124,7 +166,12 @@ function session(on: On, opts: { usage?: Partial<typeof USAGE> } = {}) {
       cost: { usd: u.usd ?? 0 },
     },
   }))
-  on('agent.list', () => ({ value: [] }))
+  on('agent.list', () => ({ value: opts.agents ?? [] }))
+  on('fs.read', ($, e) => {
+    const text = e.path === '/repo/tasks/todo.md' ? opts.todo?.() : undefined
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: text }
+  })
   on('process.run', ($, e) => {
     const sub = e.argv.slice(2).join(' ')
     const out = (stdout: string, exitCode = 0) => ({
@@ -245,6 +292,119 @@ describe('drawing', () => {
     ui = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...BAND(160) })
     expect(await ui.find({ text: '◐ ' })).toBeUndefined()
     await ui.unmount()
+  })
+
+  test('an agent shows the model its spawn resolved to, and how it runs', async ($, on) => {
+    session(on, { agents: [{ id: 'ag1', type: 'scout', description: 'find the config', status: 'running' }] })
+    // the call asks for opus; what starts (after any routing hook) is haiku
+    on('agent.spawn', () => ({ model: 'claude-haiku-4-5-20251001', agentId: 'ag1' }))
+    const held = gate()
+    const reached = gate()
+    on('tool.call', async ($, e) => {
+      if (e.tool_use_id === 'tu1') {
+        reached.open()
+        await held.shut
+      }
+      return { result: {} } as never
+    })
+    await $.command.run(run('hud', 'status'))
+    // the Agent call asks for a worktree; its spawn happens inside the call and
+    // carries the same tool_use_id
+    const call = $.tool.call({ tool: 'Agent', tool_use_id: 'tu1', description: 'find the config', prompt: 'p', subagent_type: 'scout', isolation: 'worktree' } as never)
+    await reached.shut
+    const started = await $.agent.spawn({
+      tool_use_id: 'tu1',
+      prompt: 'p',
+      description: 'find the config',
+      subagentType: 'scout',
+      model: 'opus',
+      provider: { plugin: 'engine', tier: 'core' },
+      parentModel: 'claude-opus-5-5[1m]',
+      background: true,
+      fork: false,
+    })
+    held.open()
+    await call
+    expect(started.agentId).toBe('ag1')
+    for (const surface of SURFACES) {
+      const pane = await $.ui.mount({ plugin: 'hud', surface, ...PANE })
+      expect(await pane.find({ text: ' haiku' })).toBeDefined()
+      expect(await pane.find({ text: ' opus' })).toBeUndefined()
+      expect(await pane.find({ text: ' ⎇' })).toBeDefined()
+      await pane.unmount()
+      const band = await $.ui.mount({ plugin: 'hud', surface, ...BAND(160) })
+      expect(await band.find({ text: '1 agent' })).toBeDefined()
+      expect(await band.find({ text: ' haiku 1' })).toBeDefined()
+      await band.unmount()
+    }
+  })
+
+  test("the repository's tasks/todo.md fills the Todo card, and a write to it redraws", async ($, on) => {
+    let todo = TODO_V1
+    session(on, { todo: () => todo })
+    on('tool.call', () => ({ result: {} }) as never)
+    await $.command.run(run('hud', 'status'))
+    for (const surface of SURFACES) {
+      const ui = await $.ui.mount({ plugin: 'hud', surface, ...PANE })
+      expect(await ui.find({ text: ' Todo ' })).toBeDefined()
+      expect(await ui.find({ text: ' 3 open ' })).toBeDefined()
+      expect(await ui.find({ text: 'Brief via SMTP' })).toBeDefined()
+      expect(await ui.find({ text: 'Worktree, tests, verifier' })).toBeDefined()
+      expect(await ui.find({ text: 'an example, not a task' })).toBeUndefined()
+      await ui.unmount()
+    }
+    todo = `${TODO_V1}\n- [ ] Rebuild the sidecar`
+    await $.tool.call({ tool: 'Edit', tool_use_id: 'e1', file_path: '/repo/tasks/todo.md', old_string: 'a', new_string: 'b' } as never)
+    const ui = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...PANE })
+    expect(await ui.find({ text: ' 4 open ' })).toBeDefined()
+    expect(await ui.find({ text: 'Rebuild the sidecar' })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test("a workflow run's agents fill the Workflow card and the band, and close as their loops complete", async ($, on) => {
+    session(on)
+    let n = 0
+    on('agent.spawn', () => ({ model: n++ === 0 ? 'claude-haiku-4-5-20251001' : 'claude-opus-5', agentId: `wa${n}` }))
+    on('tool.call', () => ({ result: {} }) as never)
+    await $.command.run(run('hud', 'status'))
+    await $.turn.start({ text: 'review it', turnId: 'main' })
+    const script = "export const meta = { name: 'review-changes', description: 'Review the diff' }\nawait agent('look')"
+    await $.tool.call({ tool: 'Workflow', tool_use_id: 'wf1', script } as never)
+    const spawn = (description: string, subagentType: string, agentIndex: number) =>
+      $.agent.spawn({
+        tool_use_id: 'wf1',
+        prompt: 'p',
+        description,
+        subagentType,
+        provider: { plugin: 'engine', tier: 'core' },
+        parentModel: 'claude-opus-5-5[1m]',
+        background: true,
+        fork: false,
+        workflow: { runId: 'wf_run1', agentIndex },
+      })
+    await spawn('find callers', 'scout', 1)
+    await spawn('check the fix', 'verifier', 2)
+    await $.turn.complete({ answer: 'done', durationMs: 5, isAborted: false, turnId: 'x1', agentId: 'wa1', reason: 'end_turn' } as never)
+    for (const surface of SURFACES) {
+      const pane = await $.ui.mount({ plugin: 'hud', surface, ...PANE })
+      expect(await pane.find({ text: ' Workflow ' })).toBeDefined()
+      expect(await pane.find({ text: ' 1 / 2 ' })).toBeDefined()
+      expect(await pane.find({ text: 'review-changes' })).toBeDefined()
+      expect(await pane.find({ text: ' opus' })).toBeDefined()
+      expect(await pane.find({ text: ' check the fix' })).toBeDefined()
+      await pane.unmount()
+      const band = await $.ui.mount({ plugin: 'hud', surface, ...BAND(160) })
+      expect(await band.find({ text: '1 agent' })).toBeDefined()
+      expect(await band.find({ text: ' opus 1' })).toBeDefined()
+      await band.unmount()
+    }
+    // a main-loop turn's completion is no workflow agent's
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'main', reason: 'end_turn' } as never)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 'x2', agentId: 'wa2', reason: 'end_turn' } as never)
+    const pane = await $.ui.mount({ plugin: 'hud', surface: 'terminal', ...PANE })
+    expect(await pane.find({ text: ' 2 / 2 ' })).toBeDefined()
+    expect(await pane.find({ text: '✗ ' })).toBeDefined()
+    await pane.unmount()
   })
 
   test('/hud band off hands the row back to the engine', async ($, on) => {
